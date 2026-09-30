@@ -12,6 +12,7 @@ class ChallengeResolutionResultT:
     userAgent: str = None
     screenshot: str | None = None
     turnstile_token: str = None
+    loginSuccess: bool = None
 
     def __init__(self, _dict):
         self.__dict__.update(_dict)
@@ -51,6 +52,7 @@ class V1RequestBase(object):
     disableMedia: bool = None
     # Optional when you've got a turnstile captcha that needs to be clicked after X number of Tab presses
     tabs_till_verify : int = None
+    login: dict = None
 
     def __init__(self, _dict):
         self.__dict__.update(_dict)
@@ -60,6 +62,7 @@ class V1ResponseBase(object):
     # V1ResponseBase
     status: str = None
     message: str = None
+    errorCode: str = None
     session: str = None
     sessions: list[str] = None
     startTimestamp: int = None

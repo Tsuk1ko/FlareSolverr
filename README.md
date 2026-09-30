@@ -206,6 +206,51 @@ session. When you no longer need to use a session you should make sure to close 
 | disableMedia        | Optional, default false. When true FlareSolverr will prevent media resources (images, CSS, and fonts) from being loaded to speed up navigation.                                                                                                                                                                                              |
 | tabs_till_verify    | Optional, default none. Number of times the `Tab` button is needed to be pressed to end up on the turnstile captcha, in order to verify it. After verifying the captcha, the result will be stored in the solution under `turnstile_token`.                                                                                                  |
 
+##### Optional login after the challenge
+
+`request.get` accepts a `login` object to fill and submit the current page in the same browser:
+
+```json
+{
+  "cmd": "request.get",
+  "url": "https://example.com/protected-action",
+  "session": "account-1",
+  "maxTimeout": 120000,
+  "disableMedia": false,
+  "login": {
+    "username": "your_username",
+    "password": "your_password",
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type=submit]",
+    "successText": "success"
+  }
+}
+```
+
+All six login fields are required non-empty strings. Selectors use CSS. The browser's
+`document.body.innerText`, with leading/trailing whitespace removed, must exactly equal
+`successText` (also trimmed). This works for plain-text HTML responses without a URL change.
+If the current page already matches, no form is filled or submitted. Otherwise, the form
+is submitted once; unsuccessful submissions are not automatically retried.
+
+A successful response includes `solution.loginSuccess: true`, plus the final cookies and
+any requested HTML or screenshot. `solution.response` remains the browser's HTML representation,
+not the raw HTTP response. `returnOnlyCookies` still suppresses HTML but retains `loginSuccess`.
+`maxTimeout` is the total budget for browser startup, navigation, challenges, login and waits.
+Use a separate session per account and serialize requests within each session; destroy the
+session when finished. Credentials and authenticated response bodies are not logged for
+login requests. This option does not add support for new CAPTCHA solvers.
+
+Login errors use the existing HTTP 500 / `status: "error"` response and an `errorCode`:
+
+| Error code | Meaning |
+| --- | --- |
+| `LOGIN_INVALID_PARAMS` | Missing/invalid login fields or selectors, or login used outside `request.get`. |
+| `LOGIN_FORM_NOT_FOUND` | The form or submit button could not be used within the time budget. |
+| `LOGIN_SUCCESS_TIMEOUT` | The form was submitted, but the expected text did not appear in time. |
+| `CAPTCHA_UNRESOLVED` | An unfinished CAPTCHA or Cloudflare block prevents completion. |
+
 > **Warning**
 > If you want to use Cloudflare clearance cookie in your scripts, make sure you use the FlareSolverr User-Agent too. If they don't match you will see the challenge.
 

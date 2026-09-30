@@ -1,18 +1,19 @@
 import logging
 import platform
 import sys
+import threading
 import time
 from datetime import timedelta
 from html import escape
 from urllib.parse import unquote, quote
 
 from func_timeout import FunctionTimedOut, func_timeout
-from selenium.common import TimeoutException
+from selenium.common import InvalidSelectorException, NoSuchElementException, StaleElementReferenceException, TimeoutException
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.expected_conditions import (
-    presence_of_element_located, staleness_of, title_is)
+    element_to_be_clickable, presence_of_element_located, staleness_of, title_is)
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.wait import WebDriverWait
 
@@ -56,6 +57,12 @@ TURNSTILE_SELECTORS = [
 SESSIONS_STORAGE = SessionsStorage()
 
 
+class LoginError(Exception):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def test_browser_installation():
     logging.info("Testing web browser installation...")
     logging.info("Platform: " + platform.platform())
@@ -96,7 +103,12 @@ def health_endpoint() -> HealthResponse:
 
 def controller_v1_endpoint(req: V1RequestBase) -> V1ResponseBase:
     start_ts = int(time.time() * 1000)
-    logging.info(f"Incoming request => POST /v1 body: {utils.object_to_dict(req)}")
+    if req.login is not None:
+        # Selenium DEBUG logs include send_keys arguments and authenticated responses.
+        logging.getLogger('selenium.webdriver.remote.remote_connection').setLevel(logging.WARNING)
+        logging.info("Incoming login request => POST /v1 cmd: %s", req.cmd)
+    else:
+        logging.info(f"Incoming request => POST /v1 body: {utils.object_to_dict(req)}")
     res: V1ResponseBase
     try:
         res = _controller_v1_handler(req)
@@ -105,18 +117,32 @@ def controller_v1_endpoint(req: V1RequestBase) -> V1ResponseBase:
         res.__error_500__ = True
         res.status = STATUS_ERROR
         res.message = "Error: " + str(e)
+        if isinstance(e, LoginError):
+            res.errorCode = e.code
         logging.error(res.message)
 
     res.startTimestamp = start_ts
     res.endTimestamp = int(time.time() * 1000)
     res.version = utils.get_flaresolverr_version()
-    logging.debug(f"Response => POST /v1 body: {utils.object_to_dict(res)}")
+    if req.login is not None:
+        logging.debug("Login response => status: %s, errorCode: %s", res.status, res.errorCode)
+    else:
+        logging.debug(f"Response => POST /v1 body: {utils.object_to_dict(res)}")
     logging.info(f"Response in {(res.endTimestamp - res.startTimestamp) / 1000} s")
     return res
 
 
 def _controller_v1_handler(req: V1RequestBase) -> V1ResponseBase:
     # do some validations
+    if req.login is not None:
+        fields = ('username', 'password', 'usernameSelector', 'passwordSelector',
+                  'submitSelector', 'successText')
+        if req.cmd != 'request.get' or not isinstance(req.login, dict):
+            raise LoginError('LOGIN_INVALID_PARAMS', 'login is only supported as an object in request.get.')
+        for field in fields:
+            value = req.login.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise LoginError('LOGIN_INVALID_PARAMS', f'login.{field} must be a non-empty string.')
     if req.cmd is None:
         raise Exception("Request parameter 'cmd' is mandatory.")
     if req.headers is not None:
@@ -225,11 +251,61 @@ def _cmd_sessions_destroy(req: V1RequestBase) -> V1ResponseBase:
     })
 
 
+def _get_login_driver(req: V1RequestBase, state: dict) -> WebDriver:
+    ready = threading.Event()
+    lock = threading.Lock()
+    result = {}
+
+    def acquire():
+        session = None
+        fresh = False
+        try:
+            if req.session:
+                ttl = timedelta(minutes=req.session_ttl_minutes) if req.session_ttl_minutes else None
+                session, fresh = SESSIONS_STORAGE.get(req.session, ttl)
+                driver = session.driver
+            else:
+                driver = utils.get_webdriver(req.proxy)
+            with lock:
+                cancelled = result.get('cancelled', False)
+                if not cancelled:
+                    result['driver'] = driver
+                    ready.set()
+            if cancelled:
+                # Startup cannot be interrupted safely. Dispose of a late browser when it returns.
+                if session is not None:
+                    if fresh and SESSIONS_STORAGE.sessions.get(req.session) is session:
+                        SESSIONS_STORAGE.destroy(req.session)
+                else:
+                    if utils.PLATFORM_VERSION == 'nt':
+                        driver.close()
+                    driver.quit()
+        except Exception as e:
+            with lock:
+                result['error'] = e
+                ready.set()
+
+    threading.Thread(target=acquire, daemon=True).start()
+    ready.wait(max(0, state['deadline'] - time.monotonic()))
+    with lock:
+        if not ready.is_set():
+            result['cancelled'] = True
+            raise LoginError(state['errorCode'], 'Login request timed out starting the browser.')
+        if 'error' in result:
+            raise result['error']
+        return result['driver']
+
+
 def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
     timeout = int(req.maxTimeout) / 1000
+    login_state = {'deadline': time.monotonic() + timeout,
+                   'errorCode': 'LOGIN_FORM_NOT_FOUND'} if req.login is not None else None
     driver = None
+    page_load_timeout = None
     try:
-        if req.session:
+        if login_state is not None:
+            driver = _get_login_driver(req, login_state)
+        elif req.session:
             session_id = req.session
             ttl = timedelta(minutes=req.session_ttl_minutes) if req.session_ttl_minutes else None
             session, fresh = SESSIONS_STORAGE.get(session_id, ttl)
@@ -244,12 +320,31 @@ def _resolve_challenge(req: V1RequestBase, method: str) -> ChallengeResolutionT:
         else:
             driver = utils.get_webdriver(req.proxy)
             logging.debug('New instance of webdriver has been created to perform the request')
+        if login_state is not None:
+            remaining = login_state['deadline'] - time.monotonic()
+            if remaining <= 0:
+                raise LoginError(login_state['errorCode'], 'Login request timed out starting the browser.')
+            page_load_timeout = driver.timeouts.page_load
+            driver.set_page_load_timeout(remaining)
+            return func_timeout(remaining, _evil_logic, (req, driver, method, login_state))
         return func_timeout(timeout, _evil_logic, (req, driver, method))
     except FunctionTimedOut:
+        if login_state is not None:
+            raise LoginError(login_state['errorCode'], f'Login request timed out after {timeout} seconds.')
         raise Exception(f'Error solving the challenge. Timeout after {timeout} seconds.')
+    except LoginError:
+        raise
     except Exception as e:
+        if login_state is not None:
+            raise LoginError(login_state['errorCode'],
+                             f'Browser operation failed during login ({type(e).__name__}).') from e
         raise Exception('Error solving the challenge. ' + str(e).replace('\n', '\\n'))
     finally:
+        if req.session and driver is not None and page_load_timeout is not None:
+            try:
+                driver.set_page_load_timeout(page_load_timeout)
+            except Exception as e:
+                logging.debug('Could not restore session page load timeout (%s)', type(e).__name__)
         if not req.session and driver is not None:
             if utils.PLATFORM_VERSION == "nt":
                 driver.close()
@@ -298,7 +393,7 @@ def _get_turnstile_token(driver: WebDriver, tabs: int):
         turnstile_token = token_input.get_attribute("value")
         if turnstile_token:
             if turnstile_token != current_value:
-                logging.info(f"Turnstile token: {turnstile_token}")
+                logging.info("Turnstile token acquired.")
                 return turnstile_token
         logging.debug(f"Failed to extract token possibly click failed")        
 
@@ -319,7 +414,7 @@ def _get_turnstile_token(driver: WebDriver, tabs: int):
         """)
         time.sleep(1)
 
-def _resolve_turnstile_captcha(req: V1RequestBase, driver: WebDriver):
+def _resolve_turnstile_captcha(req: V1RequestBase, driver: WebDriver, login_state: dict = None):
     turnstile_token = None
     if req.tabs_till_verify is not None:
         logging.debug(f'Navigating to... {req.url} in order to pass the turnstile challenge')
@@ -333,12 +428,89 @@ def _resolve_turnstile_captcha(req: V1RequestBase, driver: WebDriver):
                 logging.info("Turnstile challenge detected. Selector found: " + selector)
                 break
         if turnstile_challenge_found:
+            if login_state is not None:
+                login_state['errorCode'] = 'CAPTCHA_UNRESOLVED'
             turnstile_token = _get_turnstile_token(driver=driver, tabs=req.tabs_till_verify)
         else:
             logging.debug(f'Turnstile challenge not found')
     return turnstile_token
 
-def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> ChallengeResolutionT:
+def _has_unresolved_captcha(driver: WebDriver) -> bool:
+    title = driver.title.lower()
+    if any(title == t.lower() for t in CHALLENGE_TITLES) or any(
+            title.startswith(t.lower()) for t in ACCESS_DENIED_TITLES):
+        return True
+    if any(driver.find_elements(By.CSS_SELECTOR, s)
+           for s in CHALLENGE_SELECTORS + ACCESS_DENIED_SELECTORS):
+        return True
+    # A visible CAPTCHA frame plus an empty response is evidence of an unfinished challenge.
+    for response_selector, frame_selector in [
+        ("[name='g-recaptcha-response']", "iframe[src*='recaptcha']"),
+        ("[name='h-captcha-response']", "iframe[src*='hcaptcha.com']"),
+        ("[name='cf-turnstile-response']", "iframe[src*='challenges.cloudflare.com']"),
+    ]:
+        responses = driver.find_elements(By.CSS_SELECTOR, response_selector)
+        if responses and not any(el.get_attribute('value') for el in responses):
+            if any(frame.is_displayed() for frame in driver.find_elements(By.CSS_SELECTOR, frame_selector)):
+                return True
+    return False
+
+
+def _perform_login(driver: WebDriver, login: dict, state: dict):
+    def succeeded(d):
+        return (d.execute_script('return document.body ? document.body.innerText : ""') or '').strip() == login['successText'].strip()
+
+    def wait_for(condition):
+        def check(d):
+            try:
+                result = condition(d)
+            except (NoSuchElementException, StaleElementReferenceException):
+                result = False
+            if not result:
+                try:
+                    state['errorCode'] = 'CAPTCHA_UNRESOLVED' if _has_unresolved_captcha(d) else stage
+                except StaleElementReferenceException:
+                    pass
+            return result
+
+        return WebDriverWait(driver, max(0, state['deadline'] - time.monotonic()),
+                             poll_frequency=0.2,
+                             ignored_exceptions=(StaleElementReferenceException,)).until(check)
+
+    stage = 'LOGIN_FORM_NOT_FOUND'
+    if succeeded(driver):
+        return
+
+    def fill_and_submit(d):
+        nonlocal stage
+        for selector, value in [('usernameSelector', 'username'), ('passwordSelector', 'password')]:
+            element = element_to_be_clickable((By.CSS_SELECTOR, login[selector]))(d)
+            if not element:
+                return False
+            element.clear()
+            element.send_keys(login[value])
+        button = element_to_be_clickable((By.CSS_SELECTOR, login['submitSelector']))(d)
+        if not button:
+            return False
+        stage = 'LOGIN_SUCCESS_TIMEOUT'
+        state['errorCode'] = stage
+        try:
+            button.click()
+        except StaleElementReferenceException:
+            stage = 'LOGIN_FORM_NOT_FOUND'
+            raise
+        return True
+
+    try:
+        wait_for(fill_and_submit)
+        wait_for(succeeded)
+    except InvalidSelectorException as e:
+        raise LoginError('LOGIN_INVALID_PARAMS', 'A login CSS selector is invalid.') from e
+    except TimeoutException as e:
+        raise LoginError(state['errorCode'], 'Timed out waiting for the login form or success text.') from e
+
+
+def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str, login_state: dict = None) -> ChallengeResolutionT:
     res = ChallengeResolutionT({})
     res.status = STATUS_OK
     res.message = ""
@@ -379,7 +551,7 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
         if req.tabs_till_verify is None:
             driver.get(req.url)
         else:
-            turnstile_token = _resolve_turnstile_captcha(req, driver)
+            turnstile_token = _resolve_turnstile_captcha(req, driver, login_state)
 
     # set cookies if required
     if req.cookies is not None and len(req.cookies) > 0:
@@ -394,7 +566,7 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             driver.get(req.url)
 
     # wait for the page
-    if utils.get_config_log_html():
+    if utils.get_config_log_html() and req.login is None:
         logging.debug(f"Response HTML:\n{driver.page_source}")
     html_element = driver.find_element(By.TAG_NAME, "html")
     page_title = driver.title
@@ -402,12 +574,16 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
     # find access denied titles
     for title in ACCESS_DENIED_TITLES:
         if page_title.startswith(title):
+            if login_state is not None:
+                raise LoginError('CAPTCHA_UNRESOLVED', 'Cloudflare has blocked the login request.')
             raise Exception('Cloudflare has blocked this request. '
                             'Probably your IP is banned for this site, check in your web browser.')
     # find access denied selectors
     for selector in ACCESS_DENIED_SELECTORS:
         found_elements = driver.find_elements(By.CSS_SELECTOR, selector)
         if len(found_elements) > 0:
+            if login_state is not None:
+                raise LoginError('CAPTCHA_UNRESOLVED', 'Cloudflare has blocked the login request.')
             raise Exception('Cloudflare has blocked this request. '
                             'Probably your IP is banned for this site, check in your web browser.')
 
@@ -430,6 +606,8 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
     browser_wait_timeout = utils.get_config_browser_wait_timeout()
     attempt = 0
     if challenge_found:
+        if login_state is not None:
+            login_state['errorCode'] = 'CAPTCHA_UNRESOLVED'
         while True:
             try:
                 attempt = attempt + 1
@@ -469,7 +647,14 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
         logging.info("Challenge not detected!")
         res.message = "Challenge not detected!"
 
+    if login_state is not None:
+        login_state['errorCode'] = 'LOGIN_FORM_NOT_FOUND'
+        _perform_login(driver, req.login, login_state)
+        res.message = 'Login successful.'
+
     challenge_res = ChallengeResolutionResultT({})
+    if login_state is not None:
+        challenge_res.loginSuccess = True
     challenge_res.url = driver.current_url
     challenge_res.status = 200  # todo: fix, selenium not provides this info
     challenge_res.userAgent = utils.get_user_agent(driver)
