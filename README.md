@@ -216,7 +216,6 @@ session. When you no longer need to use a session you should make sure to close 
   "url": "https://example.com/protected-action",
   "session": "account-1",
   "maxTimeout": 120000,
-  "disableMedia": false,
   "login": {
     "username": "your_username",
     "password": "your_password",
@@ -229,8 +228,8 @@ session. When you no longer need to use a session you should make sure to close 
 ```
 
 All six login fields are required non-empty strings. Selectors use CSS. The browser's
-`document.body.innerText`, with leading/trailing whitespace removed, must exactly equal
-`successText` (also trimmed). This works for plain-text HTML responses without a URL change.
+`document.body.innerText` must contain `successText` (trimmed). Matching is case-sensitive.
+This works for plain-text HTML responses without a URL change.
 If the current page already matches, no form is filled or submitted. Otherwise, the form
 is submitted once; unsuccessful submissions are not automatically retried.
 
@@ -244,12 +243,12 @@ login requests. This option does not add support for new CAPTCHA solvers.
 
 Login errors use the existing HTTP 500 / `status: "error"` response and an `errorCode`:
 
-| Error code | Meaning |
-| --- | --- |
-| `LOGIN_INVALID_PARAMS` | Missing/invalid login fields or selectors, or login used outside `request.get`. |
-| `LOGIN_FORM_NOT_FOUND` | The form or submit button could not be used within the time budget. |
-| `LOGIN_SUCCESS_TIMEOUT` | The form was submitted, but the expected text did not appear in time. |
-| `CAPTCHA_UNRESOLVED` | An unfinished CAPTCHA or Cloudflare block prevents completion. |
+| Error code              | Meaning                                                                         |
+| ----------------------- | ------------------------------------------------------------------------------- |
+| `LOGIN_INVALID_PARAMS`  | Missing/invalid login fields or selectors, or login used outside `request.get`. |
+| `LOGIN_FORM_NOT_FOUND`  | The form or submit button could not be used within the time budget.             |
+| `LOGIN_SUCCESS_TIMEOUT` | The form was submitted, but the expected text did not appear in time.           |
+| `CAPTCHA_UNRESOLVED`    | An unfinished CAPTCHA or Cloudflare block prevents completion.                  |
 
 > **Warning**
 > If you want to use Cloudflare clearance cookie in your scripts, make sure you use the FlareSolverr User-Agent too. If they don't match you will see the challenge.
@@ -325,9 +324,9 @@ This works like `request.get`, with the addition of the postData parameter. Note
 ## Environment variables
 
 | Name                 | Default                | Notes                                                                                                                                    |
-|----------------------| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| -------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | LOG_LEVEL            | info                   | Verbosity of the logging. Use `LOG_LEVEL=debug` for more information.                                                                    |
-| LOG_FILE             | none                   | Path to capture log to file. Example: `/config/flaresolverr.log`.                                                                         |
+| LOG_FILE             | none                   | Path to capture log to file. Example: `/config/flaresolverr.log`.                                                                        |
 | LOG_HTML             | false                  | Only for debugging. If `true` all HTML that passes through the proxy will be logged to the console in `debug` level.                     |
 | PROXY_URL            | none                   | URL for proxy. Will be overwritten by `request` or `sessions` proxy, if used. Example: `http://127.0.0.1:8080`.                          |
 | PROXY_USERNAME       | none                   | Username for proxy. Will be overwritten by `request` or `sessions` proxy, if used. Example: `testuser`.                                  |
@@ -337,7 +336,7 @@ This works like `request.get`, with the addition of the postData parameter. Note
 | LANG                 | none                   | Language used in the web browser. Example: `LANG=en_GB`.                                                                                 |
 | HEADLESS             | true                   | Only for debugging. To run the web browser in headless mode or visible.                                                                  |
 | DISABLE_MEDIA        | false                  | To disable loading images, CSS, and other media in the web browser to save network bandwidth.                                            |
-| BROWSER_WAIT_TIMEOUT | 1                    | Seconds to wait for the web browser to reach an expected page state on each attempt. Increase it on slow hosts or slow websites.         |
+| BROWSER_WAIT_TIMEOUT | 1                      | Seconds to wait for the web browser to reach an expected page state on each attempt. Increase it on slow hosts or slow websites.         |
 | TEST_URL             | https://www.google.com | FlareSolverr makes a request on start to make sure the web browser is working. You can change that URL if it is blocked in your country. |
 | PORT                 | 8191                   | Listening port. You don't need to change this if you are running on Docker.                                                              |
 | HOST                 | 0.0.0.0                | Listening interface. You don't need to change this if you are running on Docker.                                                         |
@@ -392,4 +391,3 @@ to the file name of one of the adapters inside the `/captcha` directory.
 ## Related projects
 
 - C# implementation => https://github.com/FlareSolverr/FlareSolverrSharp
-

@@ -61,7 +61,7 @@ class LoginSite(BaseHTTPRequestHandler):
         if fields != {'email': ['demo@example.test'], 'password': ['demo-secret']}:
             self.respond('invalid credentials')
         elif self.path == '/mismatch':
-            self.respond('unsuccessful')
+            self.respond('login failed')
         elif self.path == '/captcha':
             self.respond('<html><head><title>Just a moment...</title></head>'
                          '<body><div id="cf-please-wait">Verify you are human</div></body></html>')
@@ -124,7 +124,7 @@ class TestLogin(unittest.TestCase):
         self.assertNotIn('response', res.json['solution'])
         self.assertEqual(LoginSite.submissions, 0)
 
-    def test_error_codes_and_exact_match(self):
+    def test_error_codes_without_success_text(self):
         for path, code in [('/missing', 'LOGIN_FORM_NOT_FOUND'),
                            ('/mismatch', 'LOGIN_SUCCESS_TIMEOUT'),
                            ('/captcha', 'CAPTCHA_UNRESOLVED'),

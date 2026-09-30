@@ -458,7 +458,7 @@ def _has_unresolved_captcha(driver: WebDriver) -> bool:
 
 def _perform_login(driver: WebDriver, login: dict, state: dict):
     def succeeded(d):
-        return (d.execute_script('return document.body ? document.body.innerText : ""') or '').strip() == login['successText'].strip()
+        return login['successText'].strip() in (d.execute_script('return document.body ? document.body.innerText : ""') or '')
 
     def wait_for(condition):
         def check(d):
